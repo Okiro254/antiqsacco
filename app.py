@@ -287,30 +287,41 @@ def api_member_summary(user_id):
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
 
-    with database() as conn:
-        savings = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM savings WHERE user_id = ?", (user_id,)
-        ).fetchone()[0]
-        
-        loan_row = conn.execute(
-            "SELECT principal_amount, balance_due FROM loans WHERE user_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
+    try:
+        with database() as conn:
+            # Safely query total savings
+            savings_cursor = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM savings WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            total_savings = float(savings_cursor[0]) if savings_cursor else 0.0
 
-    active_loan = None
-    if loan_row:
-        active_loan = {
-            "principal": float(loan_row["principal_amount"]),
-            "balance_due": float(loan_row["balance_due"])
-        }
+            # Safely query active loans
+            loan_row = conn.execute(
+                "SELECT principal_amount, balance_due FROM loans WHERE user_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
 
-    total_savings = float(savings)
-    return jsonify({
-        "user_id": user_id,
-        "total_savings": total_savings,
-        "max_loan_limit": round(total_savings * 3.0, 2),
-        "active_loan": active_loan
-    }), 200
+        active_loan = None
+        if loan_row:
+            active_loan = {
+                "principal": float(loan_row["principal_amount"] or 0),
+                "balance_due": float(loan_row["balance_due"] or 0)
+            }
+
+        return jsonify({
+            "status": "success",
+            "user_id": user_id,
+            "total_savings": total_savings,
+            "max_loan_limit": round(total_savings * 3.0, 2),
+            "active_loan": active_loan
+        }), 200
+
+    except Exception as e:
+        # Catch any database schema or runtime crash and return it as JSON
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }, 500)
 
 
 @app.route("/", methods=["GET", "POST"])
