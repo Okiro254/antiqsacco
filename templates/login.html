@@ -1,0 +1,26 @@
+{% extends 'base.html' %}
+{% block title %}Sign in · Antiq Sacco{% endblock %}
+{% block body_class %}auth-page{% endblock %}
+{% block auth_content %}
+<section class="auth-layout">
+  <div class="auth-story">
+    <a class="brand brand-on-dark" href="/"><span class="brand-mark">A</span><span>Antiq <span class="brand-light">Sacco</span></span></a>
+    <div class="story-content"><span class="eyebrow light-eyebrow"><i></i> MEMBER-OWNED. FUTURE-FOCUSED.</span><h1>Build together.<br><em>Grow with purpose.</em></h1><p>A steadier future starts with a savings habit. Your contributions stay invested in the community you call home.</p>
+      <div class="story-stats"><div><strong>30</strong><span>community members</span></div><div><strong>3×</strong><span>savings-backed access</span></div><div><strong>100%</strong><span>member-owned capital</span></div></div>
+    </div>
+    <div class="auth-footer">ANTIQ SACCO · COMMUNITY CAPITAL · KENYA</div>
+  </div>
+  <div class="auth-form-wrap"><div class="auth-form-inner">
+    <div class="auth-mobile-brand"><span class="brand-mark">A</span><strong>Antiq <span class="brand-light">Sacco</span></strong></div>
+    <div class="form-kicker">YOUR SACCO, IN VIEW</div><h2>Welcome back</h2><p class="auth-subtitle">Sign in to continue to your secure portal.</p>
+    {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-stack">{% for category, message in messages %}<div class="flash flash-{{ category }}" role="alert">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
+    <form method="post" class="login-form" novalidate>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label for="identity">Email address or username</label><div class="input-wrap"><span class="input-symbol">@</span><input id="identity" name="identity" type="text" autocomplete="username" placeholder="you@example.com or Major" value="{{ request.form.get('identity', request.form.get('email', '')) }}" required></div>
+      <label for="password">Password</label><div class="input-wrap"><span class="input-symbol">⌑</span><input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required><button class="password-toggle" type="button" data-password-toggle="password" aria-label="Show password">Show</button></div>
+      <button class="button button-primary button-wide" type="submit">Sign in <span>→</span></button>
+    </form>
+    <div class="auth-legal">Protected with encrypted session access.<br>Contact your SACCO administrator for account support.</div>
+  </div></div>
+</section>
+{% endblock %}
