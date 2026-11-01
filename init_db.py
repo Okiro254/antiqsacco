@@ -4,7 +4,7 @@ from datetime import date, datetime
 from werkzeug.security import generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "instance", "sacco.db")
+DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "instance", "sacco.db"))
 
 
 def get_conn():

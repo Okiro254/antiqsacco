@@ -1,11 +1,13 @@
 import os
 import json
+import io
 import shutil
 import sqlite3
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 import init_db
 from werkzeug.security import generate_password_hash
@@ -337,6 +339,41 @@ class ManualWorkflowSmokeTest(unittest.TestCase):
         member_response = client.get("/member")
         self.assertEqual(member_response.status_code, 200)
         self.assertIn(b"Monthly earnings statement", member_response.data)
+
+    def test_super_admin_can_restore_valid_database_backup(self):
+        with self.sacco_app.database() as conn:
+            conn.execute("UPDATE users SET is_super_admin = 1 WHERE id = ?", (self.admin_id,))
+        snapshot_path = Path(self.temp_dir.name) / "transfer-source.db"
+        with sqlite3.connect(init_db.DB_PATH) as source, sqlite3.connect(snapshot_path) as snapshot:
+            source.backup(snapshot)
+        with sqlite3.connect(snapshot_path) as snapshot:
+            snapshot.execute("UPDATE users SET full_name = 'Restored Member Name' WHERE id = ?", (self.member["id"],))
+            snapshot.commit()
+
+        response = self.client_as(self.admin_id, "admin").post(
+            "/super-admin/database/restore",
+            data={
+                "csrf_token": "smoke-token",
+                "confirmation": "RESTORE",
+                "database_file": (io.BytesIO(snapshot_path.read_bytes()), "transfer-source.db"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 302)
+        with self.sacco_app.database() as conn:
+            restored_name = conn.execute("SELECT full_name FROM users WHERE id = ?", (self.member["id"],)).fetchone()[0]
+        self.assertEqual(restored_name, "Restored Member Name")
+
+    def test_production_database_restore_requires_persistent_storage_flag(self):
+        with self.sacco_app.database() as conn:
+            conn.execute("UPDATE users SET is_super_admin = 1 WHERE id = ?", (self.admin_id,))
+        with patch.object(self.sacco_app, "APP_ENV", "production"), patch.dict(os.environ, {"DATABASE_PERSISTENT": "false"}):
+            response = self.client_as(self.admin_id, "admin").post(
+                "/super-admin/database/restore",
+                data={"csrf_token": "smoke-token", "confirmation": "RESTORE"},
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.sacco_app.app.config["TESTING"], True)
 
 
 if __name__ == "__main__":

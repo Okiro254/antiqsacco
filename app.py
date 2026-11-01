@@ -3,14 +3,18 @@ import secrets
 import sqlite3
 import calendar
 import json
+import shutil
+import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime
 from functools import wraps
+from pathlib import Path
 
 from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from integrations import send_sms
+import init_db as database_setup
 from init_db import get_conn, init_db
 
 APP_ENV = os.environ.get("APP_ENV", "development").lower()
@@ -27,6 +31,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="None" if APP_ENV == "production" else "Lax",
     SESSION_COOKIE_SECURE=APP_ENV == "production",
+    MAX_CONTENT_LENGTH=50 * 1024 * 1024,
 )
 
 LOAN_INTEREST_RATE = 20.0
@@ -584,7 +589,98 @@ def super_admin_dashboard():
         capital = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM savings").fetchone()[0]
         outstanding = conn.execute("SELECT COALESCE(SUM(balance_due), 0) FROM loans WHERE status = 'approved'").fetchone()[0]
         pending_loans = conn.execute("SELECT COUNT(*) FROM loans WHERE status = 'pending'").fetchone()[0]
-    return render_template("super_admin.html", total_members=total_members, staff_accounts=staff_accounts, monthly_savings=as_money(monthly_savings), capital=as_money(capital), outstanding=as_money(outstanding), pending_loans=pending_loans)
+    persistent_db = os.environ.get("DATABASE_PERSISTENT", "").lower() in {"1", "true", "yes"}
+    return render_template("super_admin.html", total_members=total_members, staff_accounts=staff_accounts, monthly_savings=as_money(monthly_savings), capital=as_money(capital), outstanding=as_money(outstanding), pending_loans=pending_loans, persistent_db=persistent_db, database_path=get_conn_path())
+
+
+def get_conn_path():
+    return str(database_setup.DB_PATH)
+
+
+def validate_database_snapshot(snapshot_path):
+    required_tables = {
+        "users", "savings", "loans", "loan_repayments", "wallet_accounts",
+        "wallet_transactions", "loan_approvals", "loan_rollovers", "loan_fines",
+        "guarantor_locks", "notifications", "dividend_runs", "dividend_allocations",
+        "member_interest_accruals", "loan_adjustments",
+    }
+    source = sqlite3.connect(f"file:{Path(snapshot_path).as_posix()}?mode=ro", uri=True)
+    try:
+        integrity = source.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise ValueError(f"Database integrity check failed: {integrity}")
+        tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        missing = required_tables - tables
+        if missing:
+            raise ValueError("Uploaded database is missing required tables: " + ", ".join(sorted(missing)))
+        user_columns = {row[1] for row in source.execute("PRAGMA table_info(users)")}
+        required_user_columns = {"id", "email", "password_hash", "full_name", "phone", "role", "date_joined", "is_super_admin", "must_change_password"}
+        if required_user_columns - user_columns:
+            raise ValueError("Uploaded database has an outdated users schema; run the app migrations on a copy first.")
+        users = source.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        admins = source.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+        members = source.execute("SELECT COUNT(*) FROM users WHERE role = 'member'").fetchone()[0]
+        if users == 0 or admins == 0:
+            raise ValueError("Uploaded database must contain at least one admin and user records.")
+        violations = source.execute("PRAGMA foreign_key_check").fetchmany(10)
+        if violations:
+            raise ValueError(f"Uploaded database contains foreign-key violations: {violations[:3]}")
+        return {"users": users, "admins": admins, "members": members}
+    finally:
+        source.close()
+
+
+def backup_current_database():
+    database_path = Path(get_conn_path())
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = database_path.with_name(f"{database_path.stem}-before-restore-{stamp}{database_path.suffix}")
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database_path) as source, sqlite3.connect(backup_path) as destination:
+        source.backup(destination)
+    return backup_path
+
+
+@app.post("/super-admin/database/restore")
+@require_role("admin")
+def restore_database():
+    if not current_user()["is_super_admin"]:
+        abort(403)
+    if APP_ENV == "production" and os.environ.get("DATABASE_PERSISTENT", "").lower() not in {"1", "true", "yes"}:
+        flash("Database restore is disabled: configure persistent Render storage and set DATABASE_PERSISTENT=true first.", "error")
+        return redirect(url_for("super_admin_dashboard") + "#database-transfer")
+    if request.form.get("confirmation", "").strip() != "RESTORE":
+        flash("Type RESTORE exactly to confirm replacing all live records.", "error")
+        return redirect(url_for("super_admin_dashboard") + "#database-transfer")
+    uploaded = request.files.get("database_file")
+    if uploaded is None or not uploaded.filename or not uploaded.filename.lower().endswith((".db", ".sqlite", ".sqlite3")):
+        flash("Choose a SQLite database backup (.db, .sqlite, or .sqlite3).", "error")
+        return redirect(url_for("super_admin_dashboard") + "#database-transfer")
+
+    target_path = Path(get_conn_path())
+    temporary_path = None
+    backup_path = None
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix="antiq-restore-", suffix=".db", dir=target_path.parent, delete=False) as temp_file:
+            temporary_path = Path(temp_file.name)
+            uploaded.save(temp_file)
+        snapshot_counts = validate_database_snapshot(temporary_path)
+        backup_path = backup_current_database()
+        with sqlite3.connect(temporary_path) as source, sqlite3.connect(target_path) as destination:
+            source.backup(destination)
+        init_db()
+        flash(
+            f"Database restored: {snapshot_counts['members']} members. Previous database backup: {backup_path.name}.",
+            "success",
+        )
+    except (OSError, sqlite3.Error, ValueError) as error:
+        if backup_path and backup_path.exists():
+            shutil.copy2(backup_path, target_path)
+        flash(f"Database restore failed; previous data was preserved. {error}", "error")
+    finally:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink()
+    return redirect(url_for("super_admin_dashboard") + "#database-transfer")
 
 
 @app.post("/super-admin/staff/register")
