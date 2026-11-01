@@ -2,6 +2,7 @@ import os
 import secrets
 import sqlite3
 import calendar
+import json
 from contextlib import contextmanager
 from datetime import date, datetime
 from functools import wraps
@@ -11,7 +12,6 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from integrations import send_sms
 from init_db import get_conn, init_db
-from flask_cors import CORS
 
 APP_ENV = os.environ.get("APP_ENV", "development").lower()
 SECRET_KEY = os.environ.get("SECRET_KEY")
@@ -25,29 +25,15 @@ app = Flask(__name__)
 app.config.update(
     SECRET_KEY=SECRET_KEY or secrets.token_urlsafe(48),
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SAMESITE="None" if APP_ENV == "production" else "Lax",
     SESSION_COOKIE_SECURE=APP_ENV == "production",
-)
-
-# Configure CORS to allow cross-origin requests from your WordPress frontend
-ALLOWED_ORIGINS = [
-    "https://antiqsacco.page.gd",
-    "http://antiqsacco.page.gd",
-    "http://localhost:5000",
-    "http://127.0.0.1:5000",
-    "*"  # Allow wildcard for flexible testing if needed
-]
-
-CORS(
-    app,
-    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
-    supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
-    methods=["GET", "POST", "OPTIONS"]
 )
 
 LOAN_INTEREST_RATE = 20.0
 MONTHLY_FINE_RATE = float(os.environ.get("MONTHLY_FINE_RATE", "0.05"))
+CHAMA_START_MONTH = 5
+CHAMA_END_MONTH = 11
+CHAMA_END_DAY = 30
 
 
 @contextmanager
@@ -71,9 +57,10 @@ def add_months(day, months=1):
 
 
 def member_cycle_status(date_joined, as_of=None):
-    cycle_start = date.fromisoformat(str(date_joined)[:10])
-    maturity_date = add_months(cycle_start, 12)
     current_date = as_of or date.today()
+    cycle_year = current_date.year if current_date.month >= CHAMA_START_MONTH else current_date.year - 1
+    cycle_start = date(cycle_year, CHAMA_START_MONTH, 1)
+    maturity_date = date(cycle_year, CHAMA_END_MONTH, CHAMA_END_DAY)
     return {
         "cycle_start": cycle_start,
         "maturity_date": maturity_date,
@@ -184,7 +171,19 @@ def member_financials(conn, user_id):
 
 
 def member_earnings_report(conn, member_id, year):
+    today = date.today()
+    accrual_end_month = 12 if year < today.year else today.month if year == today.year else 0
+    cycle = member_cycle_status(None, today)
+    for accrual_year in range(cycle["cycle_start"].year, min(year, today.year) + 1):
+        last_month = accrual_end_month if accrual_year == year else (12 if accrual_year < year else today.month)
+        for accrual_month in range(1, last_month + 1):
+            materialize_interest_accruals(conn, accrual_year, accrual_month)
+
     months = []
+    cumulative = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM member_interest_accruals WHERE user_id = ? AND period >= ? AND period < ?",
+        (member_id, cycle["cycle_start"].strftime("%Y-%m"), f"{year:04d}-01"),
+    ).fetchone()[0]
     for month in range(1, 13):
         month_start = date(year, month, 1)
         next_month = add_months(month_start)
@@ -202,17 +201,13 @@ def member_earnings_report(conn, member_id, year):
             "SELECT COALESCE(SUM(amount), 0) FROM savings WHERE date < ?",
             (month_end,),
         ).fetchone()[0]
-        interest = conn.execute(
-            "SELECT COALESCE(SUM(interest_paid), 0) FROM loan_repayments WHERE date >= ? AND date < ?",
-            (month_start.isoformat(), month_end),
-        ).fetchone()[0]
-        fines = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM loan_fines WHERE date >= ? AND date < ?",
-            (month_start.isoformat(), month_end),
-        ).fetchone()[0]
-        pool = as_money(float(interest) + float(fines))
-        share_percent = float(member_savings) / float(total_savings) if total_savings and member_savings else 0
-        share = as_money(pool * share_percent)
+        accrual = conn.execute(
+            "SELECT interest_pool, savings_basis, total_savings_basis, share_percent, amount FROM member_interest_accruals WHERE user_id = ? AND period = ?",
+            (member_id, period),
+        ).fetchone()
+        interest = float(accrual["interest_pool"]) if accrual else 0
+        share_percent = float(accrual["share_percent"]) if accrual else 0
+        share = as_money(accrual["amount"]) if accrual else 0
         member_interest_paid = conn.execute(
             "SELECT COALESCE(SUM(r.interest_paid), 0) FROM loan_repayments r JOIN loans l ON l.id = r.loan_id WHERE l.user_id = ? AND r.date >= ? AND r.date < ?",
             (member_id, month_start.isoformat(), month_end),
@@ -221,41 +216,70 @@ def member_earnings_report(conn, member_id, year):
             "SELECT COALESCE(SUM(r.amount_paid), 0) FROM loan_repayments r JOIN loans l ON l.id = r.loan_id WHERE l.user_id = ? AND r.date >= ? AND r.date < ?",
             (member_id, month_start.isoformat(), month_end),
         ).fetchone()[0]
+        if year < today.year or (year == today.year and month <= today.month):
+            cumulative = as_money(float(cumulative) + share)
         months.append({
             "period": period,
             "month_label": month_start.strftime("%b %Y"),
             "contribution": as_money(monthly_contribution),
             "savings_at_month_end": as_money(member_savings),
+            "total_savings_basis": as_money(accrual["total_savings_basis"]) if accrual else as_money(total_savings),
             "interest_income": as_money(interest),
-            "fine_income": as_money(fines),
-            "profit_pool": pool,
             "share_percent": round(share_percent * 100, 2),
             "member_share": share,
+            "cumulative_earned": as_money(cumulative),
             "member_interest_paid": as_money(member_interest_paid),
             "member_repayments": as_money(member_repayments),
-            "declared": False,
         })
     return months
 
 
-def member_exit_estimate(conn, member, earnings):
+def materialize_interest_accruals(conn, year, month):
+    month_start = date(year, month, 1)
+    month_end = add_months(month_start)
+    period = month_start.strftime("%Y-%m")
+    interest_pool = conn.execute(
+        "SELECT COALESCE(SUM(interest_paid), 0) FROM loan_repayments WHERE date >= ? AND date < ?",
+        (month_start.isoformat(), month_end.isoformat()),
+    ).fetchone()[0]
+    members = conn.execute(
+        "SELECT u.id, COALESCE(SUM(s.amount), 0) AS savings_basis FROM users u LEFT JOIN savings s ON s.user_id = u.id AND s.date < ? WHERE u.role = 'member' AND substr(u.date_joined, 1, 10) < ? GROUP BY u.id ORDER BY u.id",
+        (month_end.isoformat(), month_end.isoformat()),
+    ).fetchall()
+    total_savings = sum(float(member["savings_basis"] or 0) for member in members)
+    for member in members:
+        savings_basis = float(member["savings_basis"] or 0)
+        share_percent = savings_basis / total_savings if total_savings > 0 else 0
+        amount = as_money(float(interest_pool) * share_percent)
+        conn.execute(
+            "INSERT INTO member_interest_accruals (user_id, period, interest_pool, savings_basis, total_savings_basis, share_percent, amount, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, period) DO UPDATE SET interest_pool = excluded.interest_pool, savings_basis = excluded.savings_basis, total_savings_basis = excluded.total_savings_basis, share_percent = excluded.share_percent, amount = excluded.amount, calculated_at = excluded.calculated_at",
+            (member["id"], period, as_money(interest_pool), as_money(savings_basis), as_money(total_savings), share_percent, amount, transaction_date()),
+        )
+
+
+def member_exit_estimate(conn, member):
     member_id = member["id"]
     financials = member_financials(conn, member_id)
     wallet_balance = conn.execute(
         "SELECT COALESCE(balance, 0) FROM wallet_accounts WHERE user_id = ?",
         (member_id,),
     ).fetchone()[0]
-    declared = conn.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM dividend_allocations WHERE user_id = ? AND status = 'declared'",
-        (member_id,),
+    cycle = member_cycle_status(member["date_joined"])
+    today = date.today()
+    final_period = today.strftime("%Y-%m")
+    for accrual_year in range(cycle["cycle_start"].year, today.year + 1):
+        last_month = today.month if accrual_year == today.year else 12
+        for accrual_month in range(1, last_month + 1):
+            materialize_interest_accruals(conn, accrual_year, accrual_month)
+    accrued_interest = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM member_interest_accruals WHERE user_id = ? AND period >= ? AND period <= ?",
+        (member_id, cycle["cycle_start"].strftime("%Y-%m"), final_period),
     ).fetchone()[0]
     own_loan_due = conn.execute(
-        "SELECT COALESCE(SUM(balance_due), 0) FROM loans WHERE user_id = ? AND status IN ('approved', 'pending')",
+        "SELECT COALESCE(SUM(balance_due), 0) FROM loans WHERE user_id = ? AND status = 'approved'",
         (member_id,),
     ).fetchone()[0]
-    provisional = sum(item["member_share"] for item in earnings)
-    net_estimate = max(0, as_money(financials["savings"] + float(wallet_balance) + float(declared) - float(own_loan_due)))
-    cycle = member_cycle_status(member["date_joined"])
+    net_estimate = max(0, as_money(financials["savings"] + float(wallet_balance) + float(accrued_interest) - float(own_loan_due) - financials["guarantor_locked"]))
     payout_blocked = (
         not cycle["cycle_complete"]
         or float(own_loan_due) > 0
@@ -264,8 +288,7 @@ def member_exit_estimate(conn, member, earnings):
     return {
         "savings": financials["savings"],
         "wallet_balance": as_money(wallet_balance),
-        "declared_dividends": as_money(declared),
-        "provisional_dividends": as_money(provisional),
+        "accrued_interest": as_money(accrued_interest),
         "loan_deduction": as_money(own_loan_due),
         "guarantor_locked": financials["guarantor_locked"],
         "net_estimate": net_estimate,
@@ -283,63 +306,45 @@ def transaction_date():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ==========================================
-# WORDPRESS REST API INTEGRATION ENDPOINT
-# ==========================================
-@app.route("/api/member/summary/<int:user_id>", methods=["GET", "OPTIONS"])
+@app.get("/api/member/summary/<int:user_id>")
 def api_member_summary(user_id):
-    # Handle preflight CORS OPTIONS request immediately
-    if request.method == "OPTIONS":
-        res = jsonify({"status": "ok"})
-        res.headers.add("Access-Control-Allow-Origin", "*")
-        res.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        res.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
-        return res, 200
+    user = current_user()
+    if user is None:
+        return jsonify(status="error", message="Sign in first."), 401
+    if user["must_change_password"]:
+        return jsonify(status="error", message="Change your temporary password first."), 403
+    if user["role"] != "admin" and not user["is_super_admin"] and user["id"] != user_id:
+        return jsonify(status="error", message="You may only view your own member summary."), 403
 
-    try:
-        with database() as conn:
-            # Auto-create member #1 if missing so it never 404s
-            user_row = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-            if not user_row:
-                conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)", (user_id, f"Member #{user_id}"))
-                conn.commit()
+    with database() as conn:
+        user_row = conn.execute(
+            "SELECT id, full_name FROM users WHERE id = ? AND role = 'member'",
+            (user_id,),
+        ).fetchone()
+        if user_row is None:
+            return jsonify(status="error", message="Member not found."), 404
+        financials = member_financials(conn, user_id)
+        loan_row = conn.execute(
+            "SELECT COALESCE(SUM(principal_balance), 0) AS principal, COALESCE(SUM(balance_due), 0) AS balance_due FROM loans WHERE user_id = ? AND status = 'approved'",
+            (user_id,),
+        ).fetchone()
 
-            # Query total savings
-            savings_cursor = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM savings WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            total_savings = float(savings_cursor[0]) if savings_cursor else 0.0
+    active_loan = None
+    if float(loan_row["principal"] or 0) > 0 or float(loan_row["balance_due"] or 0) > 0:
+        active_loan = {
+            "principal": as_money(loan_row["principal"]),
+            "balance_due": as_money(loan_row["balance_due"]),
+        }
+    return jsonify({
+        "status": "success",
+        "user_id": user_id,
+        "full_name": user_row["full_name"],
+        "total_savings": financials["savings"],
+        "max_loan_limit": financials["limit"],
+        "remaining_loan_capacity": financials["remaining"],
+        "active_loan": active_loan,
+    })
 
-            # Query active loans
-            loan_row = conn.execute(
-                "SELECT principal_amount, balance_due FROM loans WHERE user_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
-
-        active_loan = None
-        if loan_row:
-            active_loan = {
-                "principal": float(loan_row["principal_amount"] or 0),
-                "balance_due": float(loan_row["balance_due"] or 0)
-            }
-
-        response = jsonify({
-            "status": "success",
-            "user_id": user_id,
-            "total_savings": total_savings,
-            "max_loan_limit": round(total_savings * 3.0, 2),
-            "active_loan": active_loan
-        })
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response, 200
-
-    except Exception as e:
-        response = jsonify({
-            "status": "error",
-            "message": str(e)
-        })
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response, 500
 
 @app.route("/", methods=["GET", "POST"])
 def login():
@@ -412,16 +417,7 @@ def member_dashboard():
     with database() as conn:
         financials = member_financials(conn, user["id"])
         earnings = member_earnings_report(conn, user["id"], report_year)
-        declared_year_total = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM dividend_allocations WHERE user_id = ? AND year = ? AND status = 'declared'",
-            (user["id"], report_year),
-        ).fetchone()[0]
-        all_earnings = [
-            item
-            for year in range(int(user["date_joined"][:4]), date.today().year + 1)
-            for item in member_earnings_report(conn, user["id"], year)
-        ]
-        exit_estimate = member_exit_estimate(conn, user, all_earnings)
+        exit_estimate = member_exit_estimate(conn, user)
         loans = conn.execute(
             "SELECT * FROM loans WHERE user_id = ? ORDER BY applied_date DESC, id DESC", (user["id"],)
         ).fetchall()
@@ -452,7 +448,7 @@ def member_dashboard():
     ledger = [{"date": row["date"], "label": row["transaction_type"].replace("_", " ").title(), "amount": row["amount"], "kind": "deposit" if row["amount"] >= 0 else "repayment"} for row in savings]
     ledger.extend({"date": row["date"], "label": f"Loan repayment · #{row['loan_id']}", "amount": row["amount_paid"], "kind": "repayment"} for row in repayments)
     ledger.sort(key=lambda item: item["date"], reverse=True)
-    return render_template("member.html", user=user, financials=financials, loans=loans, ledger=ledger, guarantor_requests=guarantor_requests, guarantors=guarantors, earnings=earnings, exit_estimate=exit_estimate, report_year=report_year, declared_year_total=as_money(declared_year_total), report_years=range(int(user["date_joined"][:4]), date.today().year + 1))
+    return render_template("member_dashboard.html", user=user, financials=financials, loans=loans, ledger=ledger, guarantor_requests=guarantor_requests, guarantors=guarantors, earnings=earnings, exit_estimate=exit_estimate, report_year=report_year, report_years=range(int(user["date_joined"][:4]), date.today().year + 1))
 
 
 @app.post("/member/loans")
@@ -566,12 +562,14 @@ def admin_dashboard():
         report_fines = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM loan_fines WHERE date >= ? AND date < ?", (report_month.isoformat(), report_end)).fetchone()[0]
         report_members = conn.execute("SELECT u.id, u.full_name, COALESCE((SELECT SUM(s.amount) FROM savings s WHERE s.user_id = u.id AND s.date < ?), 0) AS savings FROM users u WHERE u.role = 'member' ORDER BY u.id", (report_end,)).fetchall()
         report_total_savings = sum(float(row["savings"]) for row in report_members)
-        report_pool = float(report_interest) + float(report_fines)
-        declared_rows = conn.execute("SELECT user_id, amount FROM dividend_allocations WHERE year = ? AND status = 'declared'", (report_month.year,)).fetchall()
-        declared_by_member = {row["user_id"]: as_money(row["amount"]) for row in declared_rows}
-        member_monthly_report = [{"id": row["id"], "name": row["full_name"], "savings": as_money(row["savings"]), "share_percent": round(float(row["savings"]) * 100 / report_total_savings, 2) if report_total_savings else 0, "estimated_earnings": as_money(report_pool * float(row["savings"]) / report_total_savings) if report_total_savings and row["savings"] else 0, "declared_dividends": declared_by_member.get(row["id"], 0)} for row in report_members]
-        declared_pool = sum(declared_by_member.values())
-    return render_template("admin.html", capital=as_money(capital), outstanding=as_money(outstanding), pending_count=pending_count, members=members, pending=pending, interest_profit=as_money(interest_profit), fine_profit=as_money(fine_profit), monthly_collection=as_money(monthly_collection), annual_collection=as_money(annual_collection), wallet_total=as_money(wallet_total), report_period=report_period, report_interest=as_money(report_interest), report_fines=as_money(report_fines), report_pool=as_money(report_pool), declared_pool=as_money(declared_pool), member_monthly_report=member_monthly_report)
+        if report_month <= date.today().replace(day=1):
+            materialize_interest_accruals(conn, report_month.year, report_month.month)
+        accrual_rows = conn.execute("SELECT user_id, interest_pool, savings_basis, total_savings_basis, amount, share_percent FROM member_interest_accruals WHERE period = ?", (report_period,)).fetchall()
+        accrual_by_member = {row["user_id"]: row for row in accrual_rows}
+        member_monthly_report = [{"id": row["id"], "name": row["full_name"], "savings": as_money(accrual_by_member[row["id"]]["savings_basis"]) if row["id"] in accrual_by_member else 0, "total_savings_basis": as_money(accrual_by_member[row["id"]]["total_savings_basis"]) if row["id"] in accrual_by_member else 0, "interest_pool": as_money(accrual_by_member[row["id"]]["interest_pool"]) if row["id"] in accrual_by_member else 0, "share_percent": round(float(accrual_by_member[row["id"]]["share_percent"]) * 100, 2) if row["id"] in accrual_by_member else 0, "earned_interest": as_money(accrual_by_member[row["id"]]["amount"]) if row["id"] in accrual_by_member else 0} for row in report_members]
+        report_accrued = as_money(sum(item["earned_interest"] for item in member_monthly_report))
+        loan_records = conn.execute("SELECT l.*, u.full_name FROM loans l JOIN users u ON u.id = l.user_id WHERE l.status IN ('pending', 'approved') ORDER BY l.applied_date DESC, l.id DESC").fetchall()
+    return render_template("admin_dashboard.html", capital=as_money(capital), outstanding=as_money(outstanding), pending_count=pending_count, members=members, pending=pending, interest_profit=as_money(interest_profit), fine_profit=as_money(fine_profit), monthly_collection=as_money(monthly_collection), annual_collection=as_money(annual_collection), wallet_total=as_money(wallet_total), report_period=report_period, report_interest=as_money(report_interest), report_accrued=report_accrued, member_monthly_report=member_monthly_report, loan_records=loan_records)
 
 
 @app.get("/super-admin")
@@ -657,7 +655,9 @@ def member_detail(member_id):
         financials = member_financials(conn, member_id)
         savings = conn.execute("SELECT date, amount, transaction_type AS label FROM savings WHERE user_id = ? ORDER BY date DESC", (member_id,)).fetchall()
         loans = conn.execute("SELECT id, principal_amount, balance_due, status, applied_date FROM loans WHERE user_id = ? ORDER BY applied_date DESC", (member_id,)).fetchall()
-    return jsonify(member=dict(member), financials=financials, savings=[dict(row) for row in savings], loans=[dict(row) for row in loans])
+        adjustments = conn.execute("SELECT a.loan_id, a.reason, a.old_values, a.new_values, a.adjusted_at, u.full_name AS adjusted_by_name FROM loan_adjustments a JOIN loans l ON l.id = a.loan_id JOIN users u ON u.id = a.adjusted_by WHERE l.user_id = ? ORDER BY a.adjusted_at DESC, a.id DESC", (member_id,)).fetchall()
+    audit = [{**dict(row), "old_values": json.loads(row["old_values"]), "new_values": json.loads(row["new_values"])} for row in adjustments]
+    return jsonify(member=dict(member), financials=financials, savings=[dict(row) for row in savings], loans=[dict(row) for row in loans], loan_adjustments=audit)
 
 
 @app.post("/staff/deposits")
@@ -746,6 +746,45 @@ def post_repayment():
     except (ValueError, sqlite3.Error) as error:
         flash(str(error) if isinstance(error, ValueError) else "The repayment could not be posted.", "error")
     return redirect(url_for("admin_dashboard"))
+
+
+@app.post("/staff/loans/<int:loan_id>/adjust")
+@require_role("admin")
+def adjust_loan_record(loan_id):
+    reason = request.form.get("reason", "").strip()
+    if len(reason) < 8:
+        flash("Enter a correction reason with at least 8 characters.", "error")
+        return redirect(url_for("admin_dashboard") + "#loan-corrections")
+    fields = ("principal_amount", "interest_rate", "principal_balance", "interest_due", "total_payable", "balance_due")
+    try:
+        corrected = {}
+        for field in fields:
+            raw_value = request.form.get(field, "").strip()
+            value = float(raw_value)
+            if value < 0 or value != value or value == float("inf"):
+                raise ValueError(f"{field.replace('_', ' ').title()} must be a non-negative number.")
+            corrected[field] = as_money(value)
+        if corrected["interest_rate"] > 1000:
+            raise ValueError("Interest rate cannot exceed 1000%.")
+        with database() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            loan = conn.execute("SELECT * FROM loans WHERE id = ? AND status IN ('pending', 'approved')", (loan_id,)).fetchone()
+            if loan is None:
+                raise ValueError("Only a pending or active loan can be corrected here.")
+            old_values = {field: as_money(loan[field]) for field in fields}
+            conn.execute(
+                "UPDATE loans SET principal_amount = ?, interest_rate = ?, principal_balance = ?, interest_due = ?, total_payable = ?, balance_due = ? WHERE id = ?",
+                (*[corrected[field] for field in fields], loan_id),
+            )
+            conn.execute(
+                "INSERT INTO loan_adjustments (loan_id, adjusted_by, reason, old_values, new_values, adjusted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (loan_id, current_user()["id"], reason, json.dumps(old_values, sort_keys=True), json.dumps(corrected, sort_keys=True), transaction_date()),
+            )
+        flash(f"Loan #{loan_id} corrected and audit history recorded.", "success")
+    except (ValueError, sqlite3.Error) as error:
+        message = str(error) if isinstance(error, ValueError) else "The loan correction could not be saved."
+        flash(message, "error")
+    return redirect(url_for("admin_dashboard") + "#loan-corrections")
 
 
 def apply_loan_payment(conn, loan, amount, payment_type, recorded_by=None, reference=None):

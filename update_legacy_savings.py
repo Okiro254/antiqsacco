@@ -11,7 +11,7 @@ from init_db import DB_PATH, get_conn
 
 SOURCE = Path(r"C:\Users\Godigs\Downloads\ANTIQ SACCO FORMULA 2.xlsx")
 IMPORT_YEAR = 2026
-NEW_MONTH_COLUMNS = ((9, 7, "July"), (10, 8, "August"), (11, 9, "September"))
+NEW_MONTH_COLUMNS = ((9, 8, "August"), (10, 9, "September"), (11, 10, "October"))
 
 
 def number(value):
@@ -74,7 +74,7 @@ def build_preview():
             if abs(current_savings - expected_before_new_months) > 0.01:
                 raise ValueError(
                     f"Savings reconciliation failed for {entry['full_name']}: live KSh {current_savings:,.2f}, "
-                    f"expected KSh {expected_before_new_months:,.2f} before July-September entries."
+                    f"expected KSh {expected_before_new_months:,.2f} before August-October entries."
                 )
             preview.append({
                 **entry,
@@ -135,14 +135,14 @@ def apply_additions(preview):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preview or append July-September 2026 savings from the updated XLSX.")
+    parser = argparse.ArgumentParser(description="Preview or append August-October 2026 savings from the updated XLSX.")
     parser.add_argument("--apply", action="store_true", help="Back up and append only the reconciled new monthly savings entries.")
     args = parser.parse_args()
     preview, month_totals = build_preview()
     print("ADDITIVE SAVINGS UPDATE PREVIEW")
     print(f"Workbook: {SOURCE}")
     print(f"Existing members matched: {len(preview)}")
-    print(f"Source months: July-September {IMPORT_YEAR}")
+    print(f"Source months: August-October {IMPORT_YEAR} (corrected for the duplicated APR header)")
     print(f"By month: {month_totals}")
     print(f"Additional savings total: KSh {sum(member['new_amount'] for member in preview):,.2f}")
     print(f"Already present from this update: KSh {sum(member['already_posted'] for member in preview):,.2f}")

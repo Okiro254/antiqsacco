@@ -184,6 +184,34 @@ def init_db():
             created_at TEXT NOT NULL,
             UNIQUE (user_id, year)
         );
+        CREATE TABLE IF NOT EXISTS member_interest_accruals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            period TEXT NOT NULL,
+            interest_pool NUMERIC NOT NULL DEFAULT 0,
+            savings_basis NUMERIC NOT NULL DEFAULT 0,
+            total_savings_basis NUMERIC NOT NULL DEFAULT 0,
+            share_percent NUMERIC NOT NULL DEFAULT 0,
+            amount NUMERIC NOT NULL DEFAULT 0,
+            calculated_at TEXT NOT NULL,
+            UNIQUE (user_id, period)
+        );
+        CREATE TABLE IF NOT EXISTS loan_adjustments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            loan_id INTEGER NOT NULL REFERENCES loans(id),
+            adjusted_by INTEGER NOT NULL REFERENCES users(id),
+            reason TEXT NOT NULL,
+            old_values TEXT NOT NULL,
+            new_values TEXT NOT NULL,
+            adjusted_at TEXT NOT NULL
+        );
+    """)
+
+    c.execute("""
+        CREATE VIEW IF NOT EXISTS members AS
+        SELECT id, full_name, email, phone, date_joined AS joined_date, password_hash
+        FROM users
+        WHERE role = 'member'
     """)
 
     user_columns = {row[1] for row in c.execute("PRAGMA table_info(users)")}
@@ -240,39 +268,18 @@ def init_db():
     )
     admin_id = c.lastrowid
 
-    # Seed a mockup roster of 30 SACCO members
+    # Seed the requested legacy member login accounts for an empty test database.
     member_ids = []
-    for i in range(1, 31):
+    for i in range(1, 30):
         c.execute(
-            "INSERT INTO users (email, password_hash, full_name, phone, role, must_change_password, date_joined) VALUES (?,?,?,?,?,?,?)",
-            (f"member{i:02d}@sacco.co.ke", pw, f"Member {i:02d}", f"+254700{i:07d}", "member", 1, now),
+            "INSERT INTO users (username, email, password_hash, full_name, phone, role, must_change_password, date_joined) VALUES (?,?,?,?,?,?,?,?)",
+            (f"legacy{i:03d}@antiqsacco.local", f"legacy{i:03d}@antiqsacco.local", pw, f"Member {i:03d}", None, "member", 1, now),
         )
         member_ids.append(c.lastrowid)
 
     c.execute(
         "INSERT INTO wallet_accounts (user_id, balance, updated_at) SELECT id, 0, ? FROM users",
         (now,),
-    )
-
-    # Primary demo member with an active savings ledger
-    main_member = member_ids[0]
-    for date_str, amt in [
-        ("2024-01-15 09:00:00", 50000),
-        ("2024-02-15 09:00:00", 50000),
-        ("2024-03-15 09:00:00", 50000),
-    ]:
-        c.execute(
-            "INSERT INTO savings (user_id, date, amount, transaction_type, recorded_by) VALUES (?,?,?,?,?)",
-            (main_member, date_str, amt, "deposit", admin_id),
-        )
-
-    # A pending loan application awaiting underwriting
-    c.execute(
-        """
-        INSERT INTO loans (user_id, principal_amount, interest_rate, duration_months, total_payable, balance_due, status, applied_date, reviewed_by, principal_balance)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-        """,
-        (main_member, 100000, 20.0, 1, 0, 0, "pending", now, None, 100000),
     )
 
     conn.commit()

@@ -282,6 +282,7 @@ kbd { padding: 2px 5px; border: 1px solid #e2e9e4; border-radius: 3px; color: #8
 .period-picker select, .period-picker input { min-height: 33px; padding: 0 9px; border: 1px solid #dfe7e2; border-radius: 4px; background: white; color: #43554b; font: 10px var(--sans); }
 .period-picker .button { min-height: 33px; }
 .earnings-footnote { display: flex; align-items: center; gap: 9px; margin-top: 12px; padding-top: 11px; border-top: 1px solid #edf0ee; color: #78877e; font-size: 9px; }
+.calculation-note { margin: 11px 0 0; padding: 10px 12px; border-left: 3px solid #71a989; background: #f5f9f6; color: #62736a; font-size: 10px; line-height: 1.6; }
 .status-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #d29a32; }
 .exit-panel { border-top: 3px solid #5aa479; }
 .exit-window { padding: 5px 8px; border: 1px solid #dcebe0; border-radius: 4px; background: #f3f8f4; color: #547960; font-size: 8px; font-weight: 700; letter-spacing: .45px; white-space: nowrap; }

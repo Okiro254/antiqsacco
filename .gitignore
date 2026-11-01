@@ -1,4 +1,6 @@
 .env
+*.db
+*.db-*
 instance/*.db
 instance/*.db-*
 __pycache__/

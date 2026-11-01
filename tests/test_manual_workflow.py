@@ -1,5 +1,7 @@
 import os
+import json
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from datetime import date
@@ -14,17 +16,25 @@ class ManualWorkflowSmokeTest(unittest.TestCase):
     def setUpClass(cls):
         cls.original_db_path = init_db.DB_PATH
         cls.temp_dir = tempfile.TemporaryDirectory()
-        cls.test_db_path = str(Path(cls.temp_dir.name) / "sacco-test.db")
-        shutil.copyfile(cls.original_db_path, cls.test_db_path)
-        init_db.DB_PATH = cls.test_db_path
+        cls.baseline_db_path = str(Path(cls.temp_dir.name) / "sacco-baseline.db")
+        shutil.copyfile(cls.original_db_path, cls.baseline_db_path)
+        init_db.DB_PATH = cls.baseline_db_path
         import app as sacco_app
 
         cls.sacco_app = sacco_app
         cls.sacco_app.app.config.update(TESTING=True, WTF_CSRF_ENABLED=False)
-        with sacco_app.database() as conn:
-            cls.admin_id = conn.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()[0]
-            cls.member = conn.execute("SELECT id, email FROM users WHERE role = 'member' ORDER BY id LIMIT 1").fetchone()
-            cls.active_loan = conn.execute("SELECT id, user_id, balance_due FROM loans WHERE status = 'approved' ORDER BY id LIMIT 1").fetchone()
+
+    def setUp(self):
+        self.test_db_path = str(Path(self.temp_dir.name) / f"sacco-{self._testMethodName}.db")
+        shutil.copyfile(self.baseline_db_path, self.test_db_path)
+        init_db.DB_PATH = self.test_db_path
+        with self.sacco_app.database() as conn:
+            self.admin_id = conn.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()[0]
+            self.member = conn.execute("SELECT id, email FROM users WHERE role = 'member' ORDER BY id LIMIT 1").fetchone()
+            self.active_loan = conn.execute("SELECT id, user_id, balance_due FROM loans WHERE status = 'approved' ORDER BY id LIMIT 1").fetchone()
+
+    def tearDown(self):
+        init_db.DB_PATH = self.baseline_db_path
 
     @classmethod
     def tearDownClass(cls):
@@ -43,10 +53,13 @@ class ManualWorkflowSmokeTest(unittest.TestCase):
         staff = self.client_as(self.admin_id, "admin")
         staff_response = staff.get("/staff?period=2026-07")
         self.assertEqual(staff_response.status_code, 200)
-        self.assertIn(b"Monthly member allocation report", staff_response.data)
+        self.assertIn(b"Monthly loan-interest allocation", staff_response.data)
+        self.assertIn(b"TOTAL MEMBER SAVINGS", staff_response.data)
+        self.assertIn(b"INTEREST POOL", staff_response.data)
+        self.assertIn(b"Adjust current loan figures", staff_response.data)
         self.assertIn(b"Record savings deposit", staff_response.data)
 
-      # Clear password change flag so portal renders directly
+                # Clear password change flag so portal renders directly.
         with self.sacco_app.database() as conn:
             conn.execute("UPDATE users SET must_change_password = 0 WHERE id = ?", (self.member["id"],))
 
@@ -54,8 +67,11 @@ class ManualWorkflowSmokeTest(unittest.TestCase):
         member_response = member.get("/member")
         self.assertEqual(member_response.status_code, 200)
         self.assertIn(b"Monthly earnings statement", member_response.data)
-        self.assertIn(b"Maturity and settlement estimate", member_response.data)
-        self.assertIn(b"LOCKED UNTIL MATURITY", member_response.data)
+        self.assertIn(b"TOTAL MEMBER SAVINGS", member_response.data)
+        self.assertIn(b"CUMULATIVE ACCRUED", member_response.data)
+        self.assertIn(b"loan interest actually collected", member_response.data)
+        self.assertIn(b"November 30 settlement estimate", member_response.data)
+        self.assertIn(b"HELD UNTIL BREAK", member_response.data)
         self.assertNotIn(b"M-Pesa", member_response.data)
 
     def test_manual_deposit_posts_to_ledger(self):
@@ -96,7 +112,57 @@ class ManualWorkflowSmokeTest(unittest.TestCase):
         routes = [rule.rule for rule in self.sacco_app.app.url_map.iter_rules()]
         self.assertFalse(any("mpesa" in route.lower() for route in routes))
 
- def test_staff_can_register_member_but_member_cannot(self):
+    def test_member_summary_api_requires_session_and_restricts_member_ids(self):
+        anonymous = self.sacco_app.app.test_client()
+        response = anonymous.get(f"/api/member/summary/{self.member['id']}")
+        self.assertEqual(response.status_code, 401)
+
+        with self.sacco_app.database() as conn:
+            conn.execute("UPDATE users SET must_change_password = 0 WHERE id = ?", (self.member["id"],))
+            other_member_id = conn.execute("SELECT id FROM users WHERE role = 'member' AND id != ? LIMIT 1", (self.member["id"],)).fetchone()[0]
+        member = self.client_as(self.member["id"], "member")
+        own_summary = member.get(f"/api/member/summary/{self.member['id']}")
+        self.assertEqual(own_summary.status_code, 200)
+        self.assertEqual(own_summary.json["user_id"], self.member["id"])
+        other_summary = member.get(f"/api/member/summary/{other_member_id}")
+        self.assertEqual(other_summary.status_code, 403)
+
+    def test_standalone_member_api_is_registered(self):
+        routes = [rule.rule for rule in self.sacco_app.app.url_map.iter_rules()]
+        self.assertIn("/api/member/summary/<int:user_id>", routes)
+
+    def test_members_compatibility_view_has_requested_fields(self):
+        with self.sacco_app.database() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(members)")}
+            member_count = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+            user_member_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'member'").fetchone()[0]
+        self.assertTrue({"id", "full_name", "email", "phone", "joined_date", "password_hash"}.issubset(columns))
+        self.assertEqual(member_count, user_member_count)
+
+    def test_empty_database_seeds_expected_accounts_and_members_view(self):
+        original_path = init_db.DB_PATH
+        fresh_path = str(Path(self.temp_dir.name) / "fresh-seed.db")
+        try:
+            init_db.DB_PATH = fresh_path
+            self.sacco_app.init_db()
+            with self.sacco_app.database() as conn:
+                admin = conn.execute("SELECT email FROM users WHERE role = 'admin'").fetchone()
+                members = conn.execute("SELECT username, email, must_change_password FROM users WHERE role = 'member' ORDER BY username").fetchall()
+                member_projection = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+                savings_count = conn.execute("SELECT COUNT(*) FROM savings").fetchone()[0]
+                loans_count = conn.execute("SELECT COUNT(*) FROM loans").fetchone()[0]
+            self.assertEqual(admin["email"], "admin@sacco.co.ke")
+            self.assertEqual(len(members), 29)
+            self.assertEqual(members[0]["username"], "legacy001@antiqsacco.local")
+            self.assertEqual(members[-1]["username"], "legacy029@antiqsacco.local")
+            self.assertTrue(all(row["must_change_password"] for row in members))
+            self.assertEqual(member_projection, 29)
+            self.assertEqual(savings_count, 0)
+            self.assertEqual(loans_count, 0)
+        finally:
+            init_db.DB_PATH = original_path
+
+    def test_staff_can_register_member_but_member_cannot(self):
         # 1. Staff client registers a new legacy member
         staff = self.client_as(self.admin_id, "admin")
         response = staff.post("/staff/members/register", data={
@@ -122,23 +188,25 @@ class ManualWorkflowSmokeTest(unittest.TestCase):
         denied = member.post("/staff/members/register", data={"csrf_token": "smoke-token"})
         self.assertIn(denied.status_code, (302, 403))
 
-  def test_member_must_change_temporary_password_before_portal_access(self):
-        # 1. Login with imported legacy member using temporary password
-        login = self.client.post("/login", data={
-            "identity": "legacy001@antiqsacco.local",
+    def test_member_must_change_temporary_password_before_portal_access(self):
+        with self.sacco_app.database() as conn:
+            conn.execute(
+                "UPDATE users SET must_change_password = 1, password_hash = ? WHERE id = ?",
+                (generate_password_hash("password123"), self.member["id"]),
+            )
+
+        client = self.sacco_app.app.test_client()
+        client.get("/")
+        with client.session_transaction() as session:
+            csrf_token = session["csrf_token"]
+        login = client.post("/", data={
+            "identity": self.member["email"],
             "password": "password123",
-            "csrf_token": "smoke-token"
+            "csrf_token": csrf_token,
         }, follow_redirects=True)
-        
-        # 2. Verify member is redirected to password change page or prompt
         self.assertEqual(login.status_code, 200)
-        self.assertTrue(
-            b"Change password" in login.data or 
-            b"Update your password" in login.data or
-            b"must_change_password" in login.data or
-            b"Set your personal password" in login.data or
-            b"Welcome back" in login.data
-        )
+        self.assertIn(b"Set your personal password", login.data)
+        self.assertNotIn(b"Monthly earnings statement", login.data)
 
         with client.session_transaction() as session:
             password_csrf = session["csrf_token"]
@@ -155,12 +223,58 @@ class ManualWorkflowSmokeTest(unittest.TestCase):
         self.assertEqual(account["must_change_password"], 0)
 
     def test_member_savings_remain_locked_until_12_month_cycle_maturity(self):
-        cycle_before = self.sacco_app.member_cycle_status("2025-10-28 00:00:00", date.fromisoformat("2026-10-27"))
-        cycle_at = self.sacco_app.member_cycle_status("2025-10-28 00:00:00", date.fromisoformat("2026-10-28"))
+        cycle_before = self.sacco_app.member_cycle_status("2026-10-28 00:00:00", date.fromisoformat("2026-11-29"))
+        cycle_at = self.sacco_app.member_cycle_status("2026-10-28 00:00:00", date.fromisoformat("2026-11-30"))
         self.assertFalse(cycle_before["cycle_complete"])
-        self.assertEqual(cycle_before["maturity_date"].isoformat(), "2026-10-28")
+        self.assertEqual(cycle_before["maturity_date"].isoformat(), "2026-11-30")
+        self.assertEqual(cycle_before["cycle_start"].isoformat(), "2026-05-01")
         self.assertTrue(cycle_at["cycle_complete"])
-        self.assertEqual(cycle_at["months_remaining"], 0)
+        self.assertEqual(cycle_at["maturity_date"].isoformat(), "2026-11-30")
+
+    def test_monthly_interest_allocation_excludes_dividends_and_fines(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript("""
+            CREATE TABLE users (id INTEGER PRIMARY KEY, role TEXT, date_joined TEXT);
+            CREATE TABLE savings (id INTEGER PRIMARY KEY, user_id INTEGER, date TEXT, amount NUMERIC);
+            CREATE TABLE loan_repayments (id INTEGER PRIMARY KEY, loan_id INTEGER, date TEXT, interest_paid NUMERIC);
+            CREATE TABLE member_interest_accruals (
+                id INTEGER PRIMARY KEY, user_id INTEGER, period TEXT, interest_pool NUMERIC,
+                savings_basis NUMERIC, total_savings_basis NUMERIC, share_percent NUMERIC,
+                amount NUMERIC, calculated_at TEXT, UNIQUE(user_id, period)
+            );
+        """)
+        connection.executemany("INSERT INTO users VALUES (?, 'member', '2026-01-01')", [(1,), (2,)])
+        connection.executemany("INSERT INTO savings (user_id, date, amount) VALUES (?, ?, ?)", [
+            (1, "2026-01-01", 100), (2, "2026-01-01", 300),
+        ])
+        connection.execute("INSERT INTO loan_repayments (loan_id, date, interest_paid) VALUES (1, '2026-01-15', 40)")
+        self.sacco_app.materialize_interest_accruals(connection, 2026, 1)
+        allocations = connection.execute("SELECT user_id, interest_pool, amount, share_percent FROM member_interest_accruals ORDER BY user_id").fetchall()
+        self.assertEqual([round(float(row["amount"]), 2) for row in allocations], [10.0, 30.0])
+        self.assertEqual([round(float(row["interest_pool"]), 2) for row in allocations], [40.0, 40.0])
+        self.assertEqual(sum(float(row["amount"]) for row in allocations), 40.0)
+        self.assertEqual([round(float(row["share_percent"]), 2) for row in allocations], [0.25, 0.75])
+        connection.close()
+
+    def test_staff_loan_correction_is_reasoned_and_audited(self):
+        if self.active_loan is None:
+            self.skipTest("No active loan is available in the imported workbook.")
+        with self.sacco_app.database() as conn:
+            loan = conn.execute("SELECT * FROM loans WHERE id = ?", (self.active_loan["id"],)).fetchone()
+            corrected_principal = float(loan["principal_amount"]) + 1
+            data = {field: str(float(loan[field])) for field in ("principal_amount", "interest_rate", "principal_balance", "interest_due", "total_payable", "balance_due")}
+            data["principal_amount"] = str(corrected_principal)
+        data.update({"csrf_token": "smoke-token", "reason": "Corrected from signed loan register"})
+        response = self.client_as(self.admin_id, "admin").post(f"/staff/loans/{self.active_loan['id']}/adjust", data=data)
+        self.assertEqual(response.status_code, 302)
+        with self.sacco_app.database() as conn:
+            loan = conn.execute("SELECT principal_amount FROM loans WHERE id = ?", (self.active_loan["id"],)).fetchone()
+            audit = conn.execute("SELECT reason, old_values, new_values, adjusted_by FROM loan_adjustments WHERE loan_id = ? ORDER BY id DESC LIMIT 1", (self.active_loan["id"],)).fetchone()
+        self.assertEqual(float(loan["principal_amount"]), corrected_principal)
+        self.assertEqual(audit["reason"], "Corrected from signed loan register")
+        self.assertEqual(json.loads(audit["new_values"])["principal_amount"], corrected_principal)
+        self.assertEqual(audit["adjusted_by"], self.admin_id)
 
     def test_member_can_submit_3x_eligible_loan_with_guarantor(self):
         with self.sacco_app.database() as conn:

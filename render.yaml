@@ -1,8 +1,14 @@
 services:
   - type: web
-    name: antiq-sacco-api
+    name: gotai
     env: python
     region: frankfurt
     plan: free
+    autoDeployTrigger: commit
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: SECRET_KEY
+        generateValue: true
