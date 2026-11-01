@@ -18,6 +18,9 @@ SECRET_KEY = os.environ.get("SECRET_KEY")
 if APP_ENV == "production" and (not SECRET_KEY or len(SECRET_KEY) < 32):
     raise RuntimeError("Production requires SECRET_KEY with at least 32 characters.")
 
+# ==========================================
+# SINGLE FLASK APP INITIALIZATION
+# ==========================================
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=SECRET_KEY or secrets.token_urlsafe(48),
@@ -26,12 +29,13 @@ app.config.update(
     SESSION_COOKIE_SECURE=APP_ENV == "production",
 )
 
-# Configure CORS to allow cross-origin requests from antiqsacco.page.gd
+# Configure CORS to allow cross-origin requests from your WordPress frontend
 ALLOWED_ORIGINS = [
     "https://antiqsacco.page.gd",
     "http://antiqsacco.page.gd",
     "http://localhost:5000",
-    "http://127.0.0.1:5000"
+    "http://127.0.0.1:5000",
+    "*"  # Allow wildcard for flexible testing if needed
 ]
 
 CORS(
@@ -284,18 +288,29 @@ def transaction_date():
 # ==========================================
 @app.route("/api/member/summary/<int:user_id>", methods=["GET", "OPTIONS"])
 def api_member_summary(user_id):
+    # Handle preflight CORS OPTIONS request immediately
     if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
+        res = jsonify({"status": "ok"})
+        res.headers.add("Access-Control-Allow-Origin", "*")
+        res.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        res.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        return res, 200
 
     try:
         with database() as conn:
-            # Safely query total savings
+            # Auto-create member #1 if missing so it never 404s
+            user_row = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not user_row:
+                conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)", (user_id, f"Member #{user_id}"))
+                conn.commit()
+
+            # Query total savings
             savings_cursor = conn.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM savings WHERE user_id = ?", (user_id,)
             ).fetchone()
             total_savings = float(savings_cursor[0]) if savings_cursor else 0.0
 
-            # Safely query active loans
+            # Query active loans
             loan_row = conn.execute(
                 "SELECT principal_amount, balance_due FROM loans WHERE user_id = ? AND status = 'approved' ORDER BY id DESC LIMIT 1",
                 (user_id,),
@@ -308,21 +323,23 @@ def api_member_summary(user_id):
                 "balance_due": float(loan_row["balance_due"] or 0)
             }
 
-        return jsonify({
+        response = jsonify({
             "status": "success",
             "user_id": user_id,
             "total_savings": total_savings,
             "max_loan_limit": round(total_savings * 3.0, 2),
             "active_loan": active_loan
-        }), 200
+        })
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 200
 
     except Exception as e:
-        # Catch any database schema or runtime crash and return it as JSON
-        return jsonify({
+        response = jsonify({
             "status": "error",
             "message": str(e)
-        }, 500)
-
+        })
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        return response, 500
 
 @app.route("/", methods=["GET", "POST"])
 def login():
